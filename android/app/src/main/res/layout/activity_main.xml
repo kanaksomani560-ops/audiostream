@@ -25,17 +25,26 @@
         android:id="@+id/ipInput"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:hint="e.g. 192.168.1.5"
+        android:hint="e.g. 192.168.1.3"
         android:inputType="text"
         android:textSize="20sp"
         android:padding="14dp"
-        android:layout_marginBottom="24dp"/>
+        android:layout_marginBottom="16dp"/>
 
     <Button
         android:id="@+id/connectBtn"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:text="Connect"
+        android:textSize="16sp"
+        android:padding="14dp"
+        android:layout_marginBottom="12dp"/>
+
+    <Button
+        android:id="@+id/micBtn"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Use as Mic"
         android:textSize="16sp"
         android:padding="14dp"
         android:layout_marginBottom="24dp"/>
