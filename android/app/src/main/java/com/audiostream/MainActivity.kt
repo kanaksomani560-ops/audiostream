@@ -14,6 +14,8 @@ import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.Socket
+import java.util.TreeMap
+import java.util.concurrent.LinkedBlockingQueue
 import kotlin.concurrent.thread
 
 class MainActivity : AppCompatActivity() {
@@ -22,7 +24,8 @@ class MainActivity : AppCompatActivity() {
     private var micRunning = false
     private val TCP_PORT = 5005
     private val MIC_PORT = 5006
-    private val UDP_PORT = 5007  // phone listens on this for audio
+    private val UDP_PORT = 5007
+    private val JITTER_BUFFER_SIZE = 8  // hold 8 packets before playing
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -71,11 +74,10 @@ class MainActivity : AppCompatActivity() {
     private fun startUDPStream(ip: String, statusText: TextView, connectBtn: Button) {
         thread {
             try {
-                // TCP handshake to get audio config and tell server our UDP port
+                // TCP handshake
                 val tcp = Socket(ip, TCP_PORT)
                 val input = tcp.getInputStream()
 
-                // Read config
                 val header = StringBuilder()
                 var b: Int
                 while (input.read().also { b = it } != -1) {
@@ -87,11 +89,9 @@ class MainActivity : AppCompatActivity() {
                 val sampleRate = rateStr.toInt()
                 val channels = if (chStr.toInt() == 2) AudioFormat.CHANNEL_OUT_STEREO else AudioFormat.CHANNEL_OUT_MONO
 
-                // Tell server our UDP port
                 tcp.getOutputStream().write("$UDP_PORT\n".toByteArray())
                 tcp.getOutputStream().flush()
 
-                // Setup AudioTrack with minimum buffer
                 val minBuf = AudioTrack.getMinBufferSize(sampleRate, channels, AudioFormat.ENCODING_PCM_16BIT)
                 val audioTrack = AudioTrack.Builder()
                     .setAudioAttributes(AudioAttributes.Builder()
@@ -101,7 +101,7 @@ class MainActivity : AppCompatActivity() {
                         .setSampleRate(sampleRate)
                         .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
                         .setChannelMask(channels).build())
-                    .setBufferSizeInBytes(minBuf)
+                    .setBufferSizeInBytes(minBuf * 2)
                     .setTransferMode(AudioTrack.MODE_STREAM)
                     .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
                     .build()
@@ -109,21 +109,72 @@ class MainActivity : AppCompatActivity() {
                 audioTrack.play()
                 runOnUiThread { statusText.text = "Streaming (UDP) from $ip!" }
 
-                // Listen for UDP audio packets
-                val udpSock = DatagramSocket(UDP_PORT)
-                udpSock.receiveBufferSize = 4096
-                val buf = ByteArray(65536)
-                val packet = DatagramPacket(buf, buf.size)
+                // Jitter buffer: TreeMap keeps packets sorted by sequence number
+                val jitterBuffer = TreeMap<Int, ByteArray>()
+                val playQueue = LinkedBlockingQueue<ByteArray>(32)
+                var expectedSeq = -1
+                var buffering = true
 
+                // Receiver thread - fills jitter buffer
+                thread {
+                    val udpSock = DatagramSocket(UDP_PORT)
+                    udpSock.receiveBufferSize = 65536
+                    val buf = ByteArray(65536)
+                    val packet = DatagramPacket(buf, buf.size)
+
+                    while (running) {
+                        try {
+                            udpSock.receive(packet)
+                            if (packet.length > 4) {
+                                val seq = ((packet.data[0].toInt() and 0xFF) shl 24) or
+                                          ((packet.data[1].toInt() and 0xFF) shl 16) or
+                                          ((packet.data[2].toInt() and 0xFF) shl 8) or
+                                          (packet.data[3].toInt() and 0xFF)
+                                val audioData = packet.data.copyOfRange(4, packet.length)
+
+                                synchronized(jitterBuffer) {
+                                    jitterBuffer[seq] = audioData
+
+                                    // Once buffer has enough packets start playing
+                                    if (buffering && jitterBuffer.size >= JITTER_BUFFER_SIZE) {
+                                        buffering = false
+                                    }
+
+                                    if (!buffering) {
+                                        // Play in order, fill silence for missing packets
+                                        if (expectedSeq == -1) expectedSeq = jitterBuffer.firstKey()
+
+                                        while (jitterBuffer.isNotEmpty()) {
+                                            val data = jitterBuffer.remove(expectedSeq)
+                                            if (data != null) {
+                                                playQueue.offer(data)
+                                            } else {
+                                                // Missing packet - play silence
+                                                playQueue.offer(ByteArray(audioData.size))
+                                            }
+                                            expectedSeq = (expectedSeq + 1) % 65536
+                                            if (jitterBuffer.isEmpty()) break
+                                            // Don't go too far ahead
+                                            if (expectedSeq == jitterBuffer.firstKey()) break
+                                        }
+                                    }
+                                }
+                            }
+                        } catch (e: Exception) {
+                            break
+                        }
+                    }
+                    udpSock.close()
+                }
+
+                // Playback thread - reads from play queue
                 while (running) {
-                    udpSock.receive(packet)
-                    // Skip 4-byte sequence number, play audio data
-                    if (packet.length > 4) {
-                        audioTrack.write(packet.data, 4, packet.length - 4)
+                    val data = playQueue.poll(100, java.util.concurrent.TimeUnit.MILLISECONDS)
+                    if (data != null) {
+                        audioTrack.write(data, 0, data.size)
                     }
                 }
 
-                udpSock.close()
                 audioTrack.stop()
                 audioTrack.release()
                 tcp.close()
@@ -143,32 +194,23 @@ class MainActivity : AppCompatActivity() {
             try {
                 val serverAddr = InetAddress.getByName(ip)
                 val udpSock = DatagramSocket()
-
                 val sampleRate = 44100
                 val bufferSize = AudioRecord.getMinBufferSize(
                     sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
                 )
-
                 val audioRecord = AudioRecord(
-                    MediaRecorder.AudioSource.MIC,
-                    sampleRate,
-                    AudioFormat.CHANNEL_IN_MONO,
-                    AudioFormat.ENCODING_PCM_16BIT,
-                    bufferSize
+                    MediaRecorder.AudioSource.MIC, sampleRate,
+                    AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, bufferSize
                 )
-
                 audioRecord.startRecording()
-                runOnUiThread { statusText.text = "Mic streaming (UDP)!" }
-
+                runOnUiThread { statusText.text = "Mic streaming!" }
                 val buffer = ByteArray(bufferSize)
                 while (micRunning) {
                     val bytesRead = audioRecord.read(buffer, 0, buffer.size)
                     if (bytesRead > 0) {
-                        val packet = DatagramPacket(buffer, bytesRead, serverAddr, MIC_PORT)
-                        udpSock.send(packet)
+                        udpSock.send(DatagramPacket(buffer, bytesRead, serverAddr, MIC_PORT))
                     }
                 }
-
                 audioRecord.stop()
                 audioRecord.release()
                 udpSock.close()
