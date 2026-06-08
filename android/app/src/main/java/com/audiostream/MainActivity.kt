@@ -10,14 +10,19 @@ import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetAddress
+import java.net.Socket
 import kotlin.concurrent.thread
 
 class MainActivity : AppCompatActivity() {
 
     private var running = false
     private var micRunning = false
-    private val PORT = 5005
+    private val TCP_PORT = 5005
     private val MIC_PORT = 5006
+    private val UDP_PORT = 5007  // phone listens on this for audio
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -36,11 +41,11 @@ class MainActivity : AppCompatActivity() {
         connectBtn.setOnClickListener {
             if (!running) {
                 val ip = ipInput.text.toString().trim()
-                if (ip.isEmpty()) { statusText.text = "Enter IP address"; return@setOnClickListener }
+                if (ip.isEmpty()) { statusText.text = "Enter IP!"; return@setOnClickListener }
                 running = true
                 connectBtn.text = "Disconnect"
                 statusText.text = "Connecting..."
-                startAudioStream(ip, statusText, connectBtn)
+                startUDPStream(ip, statusText, connectBtn)
             } else {
                 running = false
                 connectBtn.text = "Connect"
@@ -51,10 +56,10 @@ class MainActivity : AppCompatActivity() {
         micBtn.setOnClickListener {
             if (!micRunning) {
                 val ip = ipInput.text.toString().trim()
-                if (ip.isEmpty()) { statusText.text = "Enter IP address first"; return@setOnClickListener }
+                if (ip.isEmpty()) { statusText.text = "Enter IP first!"; return@setOnClickListener }
                 micRunning = true
                 micBtn.text = "Mic ON 🔴"
-                startMicStream(ip, statusText, micBtn)
+                startMicUDP(ip, statusText, micBtn)
             } else {
                 micRunning = false
                 micBtn.text = "Use as Mic"
@@ -63,12 +68,14 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun startAudioStream(ip: String, statusText: TextView, connectBtn: Button) {
+    private fun startUDPStream(ip: String, statusText: TextView, connectBtn: Button) {
         thread {
             try {
-                val socket = java.net.Socket(ip, PORT)
-                val input = socket.getInputStream()
+                // TCP handshake to get audio config and tell server our UDP port
+                val tcp = Socket(ip, TCP_PORT)
+                val input = tcp.getInputStream()
 
+                // Read config
                 val header = StringBuilder()
                 var b: Int
                 while (input.read().also { b = it } != -1) {
@@ -80,7 +87,12 @@ class MainActivity : AppCompatActivity() {
                 val sampleRate = rateStr.toInt()
                 val channels = if (chStr.toInt() == 2) AudioFormat.CHANNEL_OUT_STEREO else AudioFormat.CHANNEL_OUT_MONO
 
-                val bufferSize = AudioTrack.getMinBufferSize(sampleRate, channels, AudioFormat.ENCODING_PCM_16BIT)
+                // Tell server our UDP port
+                tcp.getOutputStream().write("$UDP_PORT\n".toByteArray())
+                tcp.getOutputStream().flush()
+
+                // Setup AudioTrack with minimum buffer
+                val minBuf = AudioTrack.getMinBufferSize(sampleRate, channels, AudioFormat.ENCODING_PCM_16BIT)
                 val audioTrack = AudioTrack.Builder()
                     .setAudioAttributes(AudioAttributes.Builder()
                         .setUsage(AudioAttributes.USAGE_MEDIA)
@@ -89,22 +101,33 @@ class MainActivity : AppCompatActivity() {
                         .setSampleRate(sampleRate)
                         .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
                         .setChannelMask(channels).build())
-                    .setBufferSizeInBytes(bufferSize)
+                    .setBufferSizeInBytes(minBuf)
                     .setTransferMode(AudioTrack.MODE_STREAM)
+                    .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
                     .build()
 
                 audioTrack.play()
-                runOnUiThread { statusText.text = "Streaming from $ip" }
+                runOnUiThread { statusText.text = "Streaming (UDP) from $ip!" }
 
-                val buffer = ByteArray(512)
+                // Listen for UDP audio packets
+                val udpSock = DatagramSocket(UDP_PORT)
+                udpSock.receiveBufferSize = 4096
+                val buf = ByteArray(65536)
+                val packet = DatagramPacket(buf, buf.size)
+
                 while (running) {
-                    val bytesRead = input.read(buffer)
-                    if (bytesRead > 0) audioTrack.write(buffer, 0, bytesRead)
+                    udpSock.receive(packet)
+                    // Skip 4-byte sequence number, play audio data
+                    if (packet.length > 4) {
+                        audioTrack.write(packet.data, 4, packet.length - 4)
+                    }
                 }
 
-                socket.close()
+                udpSock.close()
                 audioTrack.stop()
                 audioTrack.release()
+                tcp.close()
+
             } catch (e: Exception) {
                 runOnUiThread {
                     statusText.text = "Error: ${e.message}"
@@ -115,17 +138,15 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun startMicStream(ip: String, statusText: TextView, micBtn: Button) {
+    private fun startMicUDP(ip: String, statusText: TextView, micBtn: Button) {
         thread {
             try {
-                val socket = java.net.Socket(ip, MIC_PORT)
-                val output = socket.getOutputStream()
+                val serverAddr = InetAddress.getByName(ip)
+                val udpSock = DatagramSocket()
 
                 val sampleRate = 44100
                 val bufferSize = AudioRecord.getMinBufferSize(
-                    sampleRate,
-                    AudioFormat.CHANNEL_IN_MONO,
-                    AudioFormat.ENCODING_PCM_16BIT
+                    sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
                 )
 
                 val audioRecord = AudioRecord(
@@ -137,17 +158,20 @@ class MainActivity : AppCompatActivity() {
                 )
 
                 audioRecord.startRecording()
-                runOnUiThread { statusText.text = "Mic streaming to PC!" }
+                runOnUiThread { statusText.text = "Mic streaming (UDP)!" }
 
                 val buffer = ByteArray(bufferSize)
                 while (micRunning) {
                     val bytesRead = audioRecord.read(buffer, 0, buffer.size)
-                    if (bytesRead > 0) output.write(buffer, 0, bytesRead)
+                    if (bytesRead > 0) {
+                        val packet = DatagramPacket(buffer, bytesRead, serverAddr, MIC_PORT)
+                        udpSock.send(packet)
+                    }
                 }
 
                 audioRecord.stop()
                 audioRecord.release()
-                socket.close()
+                udpSock.close()
             } catch (e: Exception) {
                 runOnUiThread {
                     statusText.text = "Mic error: ${e.message}"
