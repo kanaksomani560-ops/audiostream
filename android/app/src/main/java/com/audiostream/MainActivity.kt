@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.media.*
 import android.os.Bundle
+import android.os.PowerManager
 import android.widget.Button
 import android.widget.EditText
 import android.widget.TextView
@@ -25,11 +26,20 @@ class MainActivity : AppCompatActivity() {
     private val TCP_PORT = 5005
     private val MIC_PORT = 5006
     private val UDP_PORT = 5007
-    private val JITTER_BUFFER_SIZE = 8  // hold 8 packets before playing
+    private val JITTER_BUFFER_SIZE = 8
+    private var wakeLock: PowerManager.WakeLock? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
+
+        // Acquire WakeLock - keeps CPU running when screen is off
+        val powerManager = getSystemService(POWER_SERVICE) as PowerManager
+        wakeLock = powerManager.newWakeLock(
+            PowerManager.PARTIAL_WAKE_LOCK,
+            "AudioStream::WakeLock"
+        )
+        wakeLock?.acquire()
 
         val ipInput = findViewById<EditText>(R.id.ipInput)
         val connectBtn = findViewById<Button>(R.id.connectBtn)
@@ -71,10 +81,14 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    override fun onDestroy() {
+        super.onDestroy()
+        wakeLock?.release()
+    }
+
     private fun startUDPStream(ip: String, statusText: TextView, connectBtn: Button) {
         thread {
             try {
-                // TCP handshake
                 val tcp = Socket(ip, TCP_PORT)
                 val input = tcp.getInputStream()
 
@@ -109,13 +123,11 @@ class MainActivity : AppCompatActivity() {
                 audioTrack.play()
                 runOnUiThread { statusText.text = "Streaming (UDP) from $ip!" }
 
-                // Jitter buffer: TreeMap keeps packets sorted by sequence number
                 val jitterBuffer = TreeMap<Int, ByteArray>()
                 val playQueue = LinkedBlockingQueue<ByteArray>(32)
                 var expectedSeq = -1
                 var buffering = true
 
-                // Receiver thread - fills jitter buffer
                 thread {
                     val udpSock = DatagramSocket(UDP_PORT)
                     udpSock.receiveBufferSize = 65536
@@ -134,27 +146,20 @@ class MainActivity : AppCompatActivity() {
 
                                 synchronized(jitterBuffer) {
                                     jitterBuffer[seq] = audioData
-
-                                    // Once buffer has enough packets start playing
                                     if (buffering && jitterBuffer.size >= JITTER_BUFFER_SIZE) {
                                         buffering = false
                                     }
-
                                     if (!buffering) {
-                                        // Play in order, fill silence for missing packets
                                         if (expectedSeq == -1) expectedSeq = jitterBuffer.firstKey()
-
                                         while (jitterBuffer.isNotEmpty()) {
                                             val data = jitterBuffer.remove(expectedSeq)
                                             if (data != null) {
                                                 playQueue.offer(data)
                                             } else {
-                                                // Missing packet - play silence
                                                 playQueue.offer(ByteArray(audioData.size))
                                             }
                                             expectedSeq = (expectedSeq + 1) % 65536
                                             if (jitterBuffer.isEmpty()) break
-                                            // Don't go too far ahead
                                             if (expectedSeq == jitterBuffer.firstKey()) break
                                         }
                                     }
@@ -167,7 +172,6 @@ class MainActivity : AppCompatActivity() {
                     udpSock.close()
                 }
 
-                // Playback thread - reads from play queue
                 while (running) {
                     val data = playQueue.poll(100, java.util.concurrent.TimeUnit.MILLISECONDS)
                     if (data != null) {
