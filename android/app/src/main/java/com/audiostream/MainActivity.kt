@@ -96,7 +96,7 @@ class MainActivity : AppCompatActivity() {
                 audioTrack.play()
                 runOnUiThread { statusText.text = "Streaming from $ip" }
 
-                val buffer = ByteArray(2048)
+                val buffer = ByteArray(512)
                 while (running) {
                     val bytesRead = input.read(buffer)
                     if (bytesRead > 0) audioTrack.write(buffer, 0, bytesRead)
